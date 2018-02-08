@@ -47,6 +47,16 @@ func Create(dirpath string, metadata []byte) (*WAL, error) {
 	if err = fileutil.Preallocate(f.File, SegmentSizeBytes, true); err != nil {
 		return nil, err
 	}
+
+	w := &WAL{
+		dir:      dirpath,
+		metadata: metadata,
+	}
+	w.encoder, err = newFileEncoder(f.File, 0)
+	if err != nil {
+		return nil, err
+	}
+	w.locks = append(w.locks, f)
 }
 
 func AppendFile() {
