@@ -2,13 +2,28 @@ package main
 
 import (
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/coreos/etcd/wal/walpb"
 	"github.com/hawkingrei/wal/fileutil"
+)
+
+const (
+	metadataType int64 = iota + 1
+	entryType
+	stateType
+	crcType
+	snapshotType
+
+	// warnSyncDuration is the amount of time allotted to an fsync before
+	// logging a warning
+	warnSyncDuration = time.Second
 )
 
 var (
@@ -17,10 +32,18 @@ var (
 	// value should be used, but this is defined as an exported variable
 	// so that tests can set a different segment size.
 	SegmentSizeBytes int64 = 64 * 1000 * 1000 // 64MB
+
+	crcTable = crc32.MakeTable(crc32.Castagnoli)
 )
 
 type WAL struct {
-	dirFile *os.File
+	dir string // the living directory of the underlay files
+
+	decoder *decoder // decoder to decode records
+	encoder *encoder // encoder to encode records
+
+	metadata []byte                 // metadata recorded at the head of each WAL
+	locks    []*fileutil.LockedFile // the locked files the WAL holds (the name is increasing)
 }
 
 func Create(dirpath string, metadata []byte) (*WAL, error) {
@@ -57,6 +80,13 @@ func Create(dirpath string, metadata []byte) (*WAL, error) {
 		return nil, err
 	}
 	w.locks = append(w.locks, f)
+	if err = w.saveCrc(0); err != nil {
+		return nil, err
+	}
+}
+
+func (w *WAL) saveCrc(prevCrc uint32) error {
+	return w.encoder.encode(&walpb.Record{Type: crcType, Crc: prevCrc})
 }
 
 func AppendFile() {
