@@ -82,6 +82,12 @@ func (e *encoder) encode(rec *walpb.Record) error {
 	return err
 }
 
+func (e *encoder) flush() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.bw.Flush()
+}
+
 func encodeFrameSize(dataBytes int) (lenField uint64, padBytes int) {
 	lenField = uint64(dataBytes)
 	// force 8 byte alignment so length never gets a torn write

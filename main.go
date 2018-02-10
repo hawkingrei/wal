@@ -8,8 +8,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
+	"github.com/coreos/etcd/pkg/pbutil"
+	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/coreos/etcd/wal/walpb"
 	"github.com/hawkingrei/wal/fileutil"
 )
@@ -39,11 +42,22 @@ var (
 type WAL struct {
 	dir string // the living directory of the underlay files
 
-	decoder *decoder // decoder to decode records
+	// dirFile is a fd for the wal directory for syncing on Rename
+	dirFile *os.File
+
+	metadata []byte           // metadata recorded at the head of each WAL
+	state    raftpb.HardState // hardstate recorded at the head of WAL
+
+	start     walpb.Snapshot // snapshot to start reading
+	decoder   *decoder       // decoder to decode records
+	readClose func() error   // closer for decode reader
+
+	mu      sync.Mutex
+	enti    uint64   // index of the last entry saved to the wal
 	encoder *encoder // encoder to encode records
 
-	metadata []byte                 // metadata recorded at the head of each WAL
-	locks    []*fileutil.LockedFile // the locked files the WAL holds (the name is increasing)
+	locks []*fileutil.LockedFile // the locked files the WAL holds (the name is increasing)
+	//fp    *filePipeline
 }
 
 func Create(dirpath string, metadata []byte) (*WAL, error) {
@@ -83,6 +97,47 @@ func Create(dirpath string, metadata []byte) (*WAL, error) {
 	if err = w.saveCrc(0); err != nil {
 		return nil, err
 	}
+	if err = w.encoder.encode(&walpb.Record{Type: metadataType, Data: metadata}); err != nil {
+		return nil, err
+	}
+	if err = w.SaveSnapshot(walpb.Snapshot{}); err != nil {
+		return nil, err
+	}
+}
+
+func (w *WAL) SaveSnapshot(e walpb.Snapshot) error {
+	b := pbutil.MustMarshal(&e)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	rec := &walpb.Record{Type: snapshotType, Data: b}
+	if err := w.encoder.encode(rec); err != nil {
+		return err
+	}
+	// update enti only when snapshot is ahead of last index
+	if w.enti < e.Index {
+		w.enti = e.Index
+	}
+	return w.sync()
+}
+
+func (w *WAL) sync() error {
+	if w.encoder != nil {
+		if err := w.encoder.flush(); err != nil {
+			return err
+		}
+	}
+	start := time.Now()
+	err := fileutil.Fdatasync(w.tail().File)
+
+	duration := time.Since(start)
+	if duration > warnSyncDuration {
+		plog.Warningf("sync duration of %v, expected less than %v", duration, warnSyncDuration)
+	}
+	syncDurations.Observe(duration.Seconds())
+
+	return err
 }
 
 func (w *WAL) saveCrc(prevCrc uint32) error {
