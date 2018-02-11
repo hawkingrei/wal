@@ -7,9 +7,9 @@ import (
 	"os"
 	"sync"
 
-	"github.com/coreos/etcd/wal/walpb"
 	"github.com/hawkingrei/wal/crc"
 	"github.com/hawkingrei/wal/ioutil"
+	"github.com/hawkingrei/wal/walpb"
 )
 
 // walPageBytes is the alignment for flushing records to the backing Writer.

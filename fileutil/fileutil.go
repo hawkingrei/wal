@@ -2,6 +2,7 @@ package fileutil
 
 import (
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -72,5 +73,28 @@ func CreateDirAll(dir string) error {
 			err = fmt.Errorf("expected %q to be empty, got %q", dir, ns)
 		}
 	}
+	return err
+}
+
+// ZeroToEnd zeros a file starting from SEEK_CUR to its SEEK_END. May temporarily
+// shorten the length of the file.
+func ZeroToEnd(f *os.File) error {
+	// TODO: support FALLOC_FL_ZERO_RANGE
+	off, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	lenf, lerr := f.Seek(0, io.SeekEnd)
+	if lerr != nil {
+		return lerr
+	}
+	if err = f.Truncate(off); err != nil {
+		return err
+	}
+	// make sure blocks remain allocated
+	if err = Preallocate(f, lenf, true); err != nil {
+		return err
+	}
+	_, err = f.Seek(off, io.SeekStart)
 	return err
 }
