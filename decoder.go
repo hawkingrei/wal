@@ -170,3 +170,5 @@ func (d *decoder) updateCRC(prevCrc uint32) {
 func (d *decoder) lastCRC() uint32 {
 	return d.crc.Sum32()
 }
+
+func (d *decoder) lastOffset() int64 { return d.lastValidOff }

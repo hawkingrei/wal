@@ -1,3 +1,17 @@
+// Copyright 2015 The etcd Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
@@ -14,6 +28,7 @@ import (
 	"time"
 
 	"github.com/coreos/etcd/pkg/pbutil"
+	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/hawkingrei/wal/fileutil"
 	"github.com/hawkingrei/wal/walpb"
@@ -349,6 +364,207 @@ func (w *WAL) sync() error {
 	//syncDurations.Observe(duration.Seconds())
 
 	return err
+}
+
+// cut closes current file written and creates a new one ready to append.
+// cut first creates a temp wal file and writes necessary headers into it.
+// Then cut atomically rename temp wal file to a wal file.
+func (w *WAL) cut() error {
+	// close old wal file; truncate to avoid wasting space if an early cut
+	off, serr := w.tail().Seek(0, io.SeekCurrent)
+	if serr != nil {
+		return serr
+	}
+	if err := w.tail().Truncate(off); err != nil {
+		return err
+	}
+	if err := w.sync(); err != nil {
+		return err
+	}
+
+	fpath := filepath.Join(w.dir, walName(w.seq()+1, w.enti+1))
+
+	// create a temp wal file with name sequence + 1, or truncate the existing one
+	newTail, err := w.fp.Open()
+	if err != nil {
+		return err
+	}
+
+	// update writer and save the previous crc
+	w.locks = append(w.locks, newTail)
+	prevCrc := w.encoder.crc.Sum32()
+	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+	if err != nil {
+		return err
+	}
+	if err = w.saveCrc(prevCrc); err != nil {
+		return err
+	}
+	if err = w.encoder.encode(&walpb.Record{Type: metadataType, Data: w.metadata}); err != nil {
+		return err
+	}
+	if err = w.saveState(&w.state); err != nil {
+		return err
+	}
+	// atomically move temp wal file to wal file
+	if err = w.sync(); err != nil {
+		return err
+	}
+
+	off, err = w.tail().Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	if err = os.Rename(newTail.Name(), fpath); err != nil {
+		return err
+	}
+	if err = fileutil.Fsync(w.dirFile); err != nil {
+		return err
+	}
+
+	// reopen newTail with its new path so calls to Name() match the wal filename format
+	newTail.Close()
+
+	if newTail, err = fileutil.LockFile(fpath, os.O_WRONLY, fileutil.PrivateFileMode); err != nil {
+		return err
+	}
+	if _, err = newTail.Seek(off, io.SeekStart); err != nil {
+		return err
+	}
+
+	w.locks[len(w.locks)-1] = newTail
+
+	prevCrc = w.encoder.crc.Sum32()
+	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+	if err != nil {
+		return err
+	}
+
+	plog.Infof("segmented wal file %v is created", fpath)
+	return nil
+}
+
+func (w *WAL) seq() uint64 {
+	t := w.tail()
+	if t == nil {
+		return 0
+	}
+	seq, _, err := parseWalName(filepath.Base(t.Name()))
+	if err != nil {
+		plog.Fatalf("bad wal name %s (%v)", t.Name(), err)
+	}
+	return seq
+}
+
+func (w *WAL) saveState(s *raftpb.HardState) error {
+	if raft.IsEmptyHardState(*s) {
+		return nil
+	}
+	w.state = *s
+	b := pbutil.MustMarshal(s)
+	rec := &walpb.Record{Type: stateType, Data: b}
+	return w.encoder.encode(rec)
+}
+
+// OpenForRead only opens the wal files for read.
+// Write on a read only wal panics.
+func OpenForRead(dirpath string, snap walpb.Snapshot) (*WAL, error) {
+	return openAtIndex(dirpath, snap, false)
+}
+
+func (w *WAL) saveEntry(e *raftpb.Entry) error {
+	// TODO: add MustMarshalTo to reduce one allocation.
+	b := pbutil.MustMarshal(e)
+	rec := &walpb.Record{Type: entryType, Data: b}
+	if err := w.encoder.encode(rec); err != nil {
+		return err
+	}
+	w.enti = e.Index
+	return nil
+}
+
+func (w *WAL) Save(st raftpb.HardState, ents []raftpb.Entry) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// short cut, do not call sync
+	if raft.IsEmptyHardState(st) && len(ents) == 0 {
+		return nil
+	}
+
+	mustSync := raft.MustSync(st, w.state, len(ents))
+
+	// TODO(xiangli): no more reference operator
+	for i := range ents {
+		if err := w.saveEntry(&ents[i]); err != nil {
+			return err
+		}
+	}
+	if err := w.saveState(&st); err != nil {
+		return err
+	}
+
+	curOff, err := w.tail().Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	if curOff < SegmentSizeBytes {
+		if mustSync {
+			return w.sync()
+		}
+		return nil
+	}
+
+	return w.cut()
+}
+
+// ReleaseLockTo releases the locks, which has smaller index than the given index
+// except the largest one among them.
+// For example, if WAL is holding lock 1,2,3,4,5,6, ReleaseLockTo(4) will release
+// lock 1,2 but keep 3. ReleaseLockTo(5) will release 1,2,3 but keep 4.
+func (w *WAL) ReleaseLockTo(index uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if len(w.locks) == 0 {
+		return nil
+	}
+
+	var smaller int
+	found := false
+
+	for i, l := range w.locks {
+		_, lockIndex, err := parseWalName(filepath.Base(l.Name()))
+		if err != nil {
+			return err
+		}
+		if lockIndex >= index {
+			smaller = i - 1
+			found = true
+			break
+		}
+	}
+
+	// if no lock index is greater than the release index, we can
+	// release lock up to the last one(excluding).
+	if !found {
+		smaller = len(w.locks) - 1
+	}
+
+	if smaller <= 0 {
+		return nil
+	}
+
+	for i := 0; i < smaller; i++ {
+		if w.locks[i] == nil {
+			continue
+		}
+		w.locks[i].Close()
+	}
+	w.locks = w.locks[smaller:]
+
+	return nil
 }
 
 // The snap SHOULD have been previously saved to the WAL, or the following
